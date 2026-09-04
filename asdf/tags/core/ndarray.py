@@ -253,6 +253,135 @@ def inline_array_relax_empty_shape(array: NDArray, shape: tuple[int | str, ...] 
     return array
 
 
+class MemmapArrayView(np.memmap):
+    """
+    An ``ndarray`` backed by a memory-mapped ASDF block, which checks that
+    the mapping is still open before touching it.
+
+    This subclasses `numpy.memmap` rather than `numpy.ndarray` so that
+    ``isinstance(array.base, np.memmap)`` still identifies memmapped data,
+    as it did before this class existed.
+
+    Handing back a plain ``ndarray`` view of a memmapped block means that
+    once the file is closed, using that view reads unmapped memory: numpy
+    has no idea the mapping is gone, so this is a use-after-free that
+    segfaults (or silently returns garbage) rather than raising. There is no
+    way to intercept the read itself -- it's a hardware fault, not something
+    Python can catch -- so the check has to happen just before, which is
+    what this class is for.
+
+    The guard is a reference to the ``mmap.mmap`` object. Holding it costs
+    nothing: closing an mmap tears the mapping down regardless of how many
+    Python references remain, and the object then simply reports
+    ``closed == True``. So this does *not* keep the file open (which was the
+    bug this whole mechanism replaces); it only lets us notice.
+
+    ``__array_finalize__`` propagates the guard to views derived from this
+    one, so it survives arbitrary chaining (``arr.reshape(...).swapaxes(...)``).
+    Results that own their own memory -- ``.copy()``, advanced indexing,
+    arithmetic -- are not affected: the check confirms the mapping is
+    actually still in the array's base chain before raising, so an
+    independent copy of the data stays usable after the file is closed.
+
+    What this can't cover is anything that deliberately drops back to an
+    unguarded array or a raw buffer: ``np.asarray(view)`` and
+    ``view.view(np.ndarray)`` return base-class views, and ``.data``/
+    ``.ctypes`` hand out the buffer directly. Those share the mapping with
+    no guard attached, and accessing them after close is still undefined
+    behavior.
+    """
+
+    def __array_finalize__(self, obj):
+        super().__array_finalize__(obj)
+        if obj is None:
+            return
+        self._asdf_mmap = getattr(obj, "_asdf_mmap", None)
+
+    def _asdf_check_open(self):
+        """
+        Raise if this array's data lives in a mapping that has been closed.
+        """
+        mmap_obj = getattr(self, "_asdf_mmap", None)
+        # fast path: no guard, or the file is still open. This is the only
+        # work done while the file is open, so keep it to a getattr + a bool.
+        if mmap_obj is None or not mmap_obj.closed:
+            return
+        # The guard is inherited by every array finalized from a guarded one,
+        # including ones that own their memory (advanced indexing allocates a
+        # fresh buffer but still reports OWNDATA=False, so OWNDATA can't be
+        # used to tell them apart). Walk to the array that actually owns the
+        # memory and only raise if it is the closed mapping.
+        base = self
+        while isinstance(base.base, np.ndarray):
+            base = base.base
+        if base.base is mmap_obj:
+            msg = "ASDF file has already been closed. Can not get the data."
+            raise OSError(msg)
+
+    def __getitem__(self, key):
+        self._asdf_check_open()
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        self._asdf_check_open()
+        super().__setitem__(key, value)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        for value in (*inputs, *kwargs.get("out", ())):
+            if isinstance(value, MemmapArrayView):
+                value._asdf_check_open()
+        # hand the ufunc plain ndarrays so results don't carry the guard
+        # (they are freshly allocated and independent of the mapping)
+        args = [x.view(np.ndarray) if isinstance(x, MemmapArrayView) else x for x in inputs]
+        if "out" in kwargs:
+            kwargs["out"] = tuple(
+                o.view(np.ndarray) if isinstance(o, MemmapArrayView) else o for o in kwargs["out"]
+            )
+        return getattr(ufunc, method)(*args, **kwargs)
+
+    def __array_function__(self, func, types, args, kwargs):
+        self._asdf_check_open()
+        return super().__array_function__(func, types, args, kwargs)
+
+    def _asdf_is_closed(self):
+        try:
+            self._asdf_check_open()
+        except OSError:
+            return True
+        return False
+
+    # repr/str must never raise: they're called while building error messages
+    # and tracebacks (see the __repr__ note in NDArrayType.__setitem__), so a
+    # raising repr turns an unrelated failure into a confusing one. Describe
+    # the state instead. Reading .shape/.dtype is safe -- they live on the
+    # array object, not in the mapping.
+    def __repr__(self):
+        if self._asdf_is_closed():
+            return f"<{type(self).__name__} (file closed) shape: {self.shape} dtype: {self.dtype}>"
+        return super().__repr__()
+
+    def __str__(self):
+        if self._asdf_is_closed():
+            return self.__repr__()
+        return super().__str__()
+
+
+def _guard_memmap_array(array):
+    """
+    If ``array`` is backed by an open memory map, return it as a
+    `MemmapArrayView` carrying a guard for that mapping; otherwise return it
+    unchanged.
+    """
+    if not isinstance(array, np.ndarray) or isinstance(array, MemmapArrayView):
+        return array
+    base = util.get_array_base(array)
+    if not (isinstance(base, np.memmap) and isinstance(base.base, mmap.mmap)):
+        return array
+    guarded = array.view(MemmapArrayView)
+    guarded._asdf_mmap = base.base
+    return guarded
+
+
 class NDArrayType:
     def __init__(self, source, shape, dtype, offset, strides, order, mask, data_callback=None):
         self._source = source
@@ -297,9 +426,13 @@ class NDArrayType:
                     fd = self._data_callback(_attr="_fd")()
                 except AttributeError:
                     # external blocks do not have a '_fd' and don't need to be updated
-                    fd = None
-                if fd is not None:
-                    if getattr(fd, "_mmap", None) is not base.base:
+                    fd = util.NOT_SET
+                # If the file's GenericFile has already been garbage collected (e.g.
+                # AsdfFile.close() dropped the last strong reference to it), then
+                # `fd` is None. That means the file is gone and this cached array can
+                # no longer be trusted, so treat it the same as a straight mismatch.
+                if fd is not util.NOT_SET:
+                    if fd is None or getattr(fd, "_mmap", None) is not base.base:
                         self._array = None
                     del fd
 
@@ -317,6 +450,12 @@ class NDArrayType:
                 msg = "ASDF file has already been closed. Can not get the data."
                 raise OSError(msg)
 
+            # Guard the block data before building the array from it, so that
+            # the array's own base chain is guarded too and `arr.base` isn't a
+            # way to get at an unchecked view of the mapping. This is a view,
+            # so blocks shared between NDArrayTypes still share their memory.
+            data = _guard_memmap_array(data)
+
             # compute shape (streaming blocks have '0' data size in the block header)
             shape = self.get_actual_shape(
                 self._shape,
@@ -325,6 +464,7 @@ class NDArrayType:
                 data.size,
             )
             self._array = np.ndarray(shape, self._dtype, data, self._offset, self._strides, self._order)
+            self._array = _guard_memmap_array(self._array)
             self._array = self._apply_mask(self._array, self._mask)
         return self._array
 

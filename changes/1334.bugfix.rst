@@ -1,0 +1,19 @@
+Fixed ``with asdf.open(..., memmap=True)`` which was leaving the underlying
+file open indefinitely after the context manager exited if a memmapped array
+was still referenced. Exiting ``with`` now unmaps the file again, restoring
+the context manager's contract.
+
+To keep that from reintroducing the segfaults that the previous behavior
+(leak) was allowing, arrays read from memmapped blocks are now handed back
+as ``asdf.tags.core.ndarray.MemmapArrayView`` (a ``numpy.memmap`` subclass),
+which raises ``OSError`` if it is used after the file is closed -- or after
+``update()`` remaps it -- instead of reading unmapped memory. The guard is
+inherited by views derived from those arrays, so it survives slicing,
+``.T``, ``.reshape()`` and further chaining. Results that own their memory
+(``.copy()``, advanced indexing, arithmetic) are unaffected and remain
+usable after the file is closed.
+
+Note that ``np.asarray(v)`` and ``v.view(numpy.ndarray)`` deliberately
+drop back to a plain array sharing the same memory, and numpy provides no
+hook to intercept that; using their result after the file is closed is still
+undefined behavior. Copy the data instead if it needs to outlive the file.
