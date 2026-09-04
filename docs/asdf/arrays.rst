@@ -482,9 +482,34 @@ context.
         print(af["my_array"][0])
 
 Attempting to access memory mapped array data after the corresponding
-file has been closed will result in an error.
+file has been closed will result in an error. This applies to views taken
+from that data as well (``af["my_array"][:10]``, ``.T``, ``.reshape(...)``
+and so on): they are returned as ``MemmapArrayView``, a `numpy.memmap`
+subclass that raises if it is used once the mapping is gone. The same is
+true after `~asdf.AsdfFile.update`, which remaps the file.
+
+If array data needs to outlive the file, copy it out while the file is
+open. Copies own their memory, so they are unaffected by the file closing,
+as are results that allocate fresh memory such as arithmetic and
+"fancy"/boolean indexing.
+
+.. code::
+
+    with asdf.open('my_data.asdf', memmap=True) as af:
+        subset = af["my_array"][:10].copy()
+
+    # usable after the file is closed, because it is a copy
+    print(subset[0])
 
 .. warning::
 
    If a file is opened with memory mapping and write access
    any changes to the array data will change the corresponding file.
+
+.. warning::
+
+   ``numpy.asarray(v)`` and ``v.view(numpy.ndarray)`` return a plain
+   array sharing the mapped memory, and numpy provides no way to attach the
+   check to it. Using such an array after the file is closed is undefined
+   behavior and may crash the interpreter rather than raise. Copy the data
+   instead if it needs to outlive the file.

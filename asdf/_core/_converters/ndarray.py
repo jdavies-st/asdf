@@ -14,6 +14,7 @@ class NDArrayConverter(Converter):
         "numpy.ma.MaskedArray",  # in numpy 2.0
         "numpy.ma.core.MaskedArray",
         "asdf.tags.core.ndarray.NDArrayType",
+        "asdf.tags.core.ndarray.MemmapArrayView",
         "asdf.tags.core.stream.Stream",
     ]
 

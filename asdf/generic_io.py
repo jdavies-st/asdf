@@ -800,10 +800,8 @@ class RealFile(RandomAccessFile):
 
     def close_memmap(self):
         if hasattr(self, "_mmap"):
-            # we no longer close the _mmap here. This does mean that views of arrays
-            # that are backed by _mmap will keep the _mmap alive (and open). This is
-            # the cost of avoiding segfaults as np.memmap does not check if mmap is
-            # closed.
+            if not self._mmap.closed:
+                self._mmap.close()
             del self._mmap
 
     def flush_memmap(self):
