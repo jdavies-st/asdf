@@ -1,8 +1,15 @@
 from functools import cached_property
 from typing import Any
 
+import numpy as np
+from packaging.version import Version
+
 from . import versioning
 from ._version import version as asdf_package_version
+
+# Older numpy behavior that asdf works around (see tags/core/ndarray.py).
+NUMPY_LT_1_23 = Version(np.__version__) < Version("1.23")
+NUMPY_LT_1_25 = Version(np.__version__) < Version("1.25")
 
 
 def validate_version(version):

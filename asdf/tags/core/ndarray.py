@@ -8,6 +8,7 @@ import numpy as np
 from numpy import ma
 
 from asdf import util
+from asdf._helpers import NUMPY_LT_1_23, NUMPY_LT_1_25
 from asdf._jsonschema import ValidationError
 
 if typing.TYPE_CHECKING:
@@ -352,6 +353,19 @@ class MemmapArrayView(np.memmap):
         self._asdf_check_open()
         super().__setitem__(key, value)
 
+    if NUMPY_LT_1_25:
+        # numpy < 1.25 catches errors raised during == and != and returns
+        # False/True instead (with a DeprecationWarning), which would hide the
+        # closed file, so check before numpy sees the comparison.  This
+        # behavior is fixed in 1.25, and is consistent in 2.x.
+        def __eq__(self, other):
+            self._asdf_check_open()
+            return super().__eq__(other)
+
+        def __ne__(self, other):
+            self._asdf_check_open()
+            return super().__ne__(other)
+
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         for value in (*inputs, *kwargs.get("out", ())):
             if isinstance(value, MemmapArrayView):
@@ -577,6 +591,12 @@ class NDArrayType:
         # getting "double casted" and upsized.  This also reduces the
         # number of array creations in the general case.
         if attr == "__array_struct__":
+            raise AttributeError
+        # numpy < 1.23 ignores (with a DeprecationWarning) any error raised
+        # while looking up __array_interface__, e.g. OSError from a closed
+        # file, and falls back to __array__. Hide it so numpy goes straight to
+        # __array__, which raises cleanly.
+        if NUMPY_LT_1_23 and attr == "__array_interface__":
             raise AttributeError
         # AsdfFile.info will call hasattr(obj, "__asdf_traverse__") which
         # will trigger this method, making the array, and loading the array
