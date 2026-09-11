@@ -1115,6 +1115,22 @@ _MEMMAP_VIEW_CALLS = [
     pytest.param(lambda view: view[0], id="getitem"),
     pytest.param(lambda view: operator.setitem(view, 0, 1), id="setitem"),
     pytest.param(lambda view: np.concatenate([view, view]), id="concatenate"),
+    pytest.param(lambda view: view.copy(), id="copy"),
+    pytest.param(lambda view: view.flatten(), id="flatten"),
+    pytest.param(lambda view: view.astype("int32"), id="astype"),
+    pytest.param(lambda view: view.tolist(), id="tolist"),
+    pytest.param(lambda view: view.tobytes(), id="tobytes"),
+    pytest.param(lambda view: view.item(0), id="item"),
+    pytest.param(lambda view: view.fill(1), id="fill"),
+    pytest.param(lambda view: view.sort(), id="sort"),
+    pytest.param(lambda view: view.take([0]), id="take"),
+    pytest.param(lambda view: view.repeat(2), id="repeat"),
+    pytest.param(lambda view: view.put([0], [1]), id="put"),
+    pytest.param(lambda view: view.argmax(), id="argmax"),
+    pytest.param(lambda view: view.nonzero(), id="nonzero"),
+    pytest.param(lambda view: view.searchsorted(1), id="searchsorted"),
+    pytest.param(lambda view: view.dot(view), id="dot"),
+    pytest.param(lambda view: view.round(), id="round"),
 ]
 
 

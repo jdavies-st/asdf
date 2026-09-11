@@ -253,6 +253,14 @@ def inline_array_relax_empty_shape(array: NDArray, shape: tuple[int | str, ...] 
     return array
 
 
+# Attributes of a MemmapArrayView that live on the array object rather than in
+# the mapping, so they stay readable after the file is closed (__repr__ uses
+# shape and dtype, and _asdf_check_open walks .base).
+_MEMMAP_UNCHECKED_ATTRS = frozenset(
+    ("shape", "dtype", "ndim", "size", "itemsize", "nbytes", "strides", "flags", "base", "filename", "offset", "mode")
+)
+
+
 class MemmapArrayView(np.memmap):
     """
     An ``ndarray`` backed by a memory-mapped ASDF block, which checks that
@@ -276,6 +284,12 @@ class MemmapArrayView(np.memmap):
     ``closed == True``. So this does *not* keep the file open (which was the
     bug this whole mechanism replaces); it only lets us notice.
 
+    The check runs on indexing, ufuncs, numpy functions, and every public
+    attribute lookup, so ndarray methods implemented in C that read the
+    buffer directly (``.copy()``, ``.tolist()``, ``.astype()``, ...) raise
+    too. Metadata that lives on the array object rather than in the mapping
+    (``shape``, ``dtype``, ``strides``, ...) stays readable.
+
     ``__array_finalize__`` propagates the guard to views derived from this
     one, so it survives arbitrary chaining (``arr.reshape(...).swapaxes(...)``).
     Results that own their own memory -- ``.copy()``, advanced indexing,
@@ -283,12 +297,13 @@ class MemmapArrayView(np.memmap):
     actually still in the array's base chain before raising, so an
     independent copy of the data stays usable after the file is closed.
 
-    What this can't cover is anything that deliberately drops back to an
-    unguarded array or a raw buffer: ``np.asarray(view)`` and
-    ``view.view(np.ndarray)`` return base-class views, and ``.data``/
-    ``.ctypes`` hand out the buffer directly. Those share the mapping with
-    no guard attached, and accessing them after close is still undefined
-    behavior.
+    What this can't cover is anything that reads the memory without going
+    through the array's Python methods: the buffer protocol (``bytes(view)``,
+    ``memoryview(view)``) and ``np.asarray(view)``/``np.array(view)``, which
+    numpy handles entirely in C. The same goes for plain arrays and raw
+    buffers taken from the view while the file is open
+    (``view.view(np.ndarray)``, ``.data``, ``.ctypes``). Using any of those
+    after close is still undefined behavior.
     """
 
     def __array_finalize__(self, obj):
@@ -318,6 +333,17 @@ class MemmapArrayView(np.memmap):
             msg = "ASDF file has already been closed. Can not get the data."
             raise OSError(msg)
 
+    def __getattribute__(self, name):
+        # ndarray methods implemented in C (.copy(), .tolist(), ...) read the
+        # buffer without passing through any of the hooks below, so check
+        # every public attribute lookup instead. This runs on every lookup, so
+        # while the file is open it only reads the guard and its closed flag.
+        if not name.startswith("_") and name not in _MEMMAP_UNCHECKED_ATTRS:
+            mmap_obj = np.ndarray.__getattribute__(self, "__dict__").get("_asdf_mmap")
+            if mmap_obj is not None and mmap_obj.closed:
+                self._asdf_check_open()
+        return np.ndarray.__getattribute__(self, name)
+
     def __getitem__(self, key):
         self._asdf_check_open()
         return super().__getitem__(key)
@@ -334,9 +360,7 @@ class MemmapArrayView(np.memmap):
         # (they are freshly allocated and independent of the mapping)
         args = [x.view(np.ndarray) if isinstance(x, MemmapArrayView) else x for x in inputs]
         if "out" in kwargs:
-            kwargs["out"] = tuple(
-                o.view(np.ndarray) if isinstance(o, MemmapArrayView) else o for o in kwargs["out"]
-            )
+            kwargs["out"] = tuple(o.view(np.ndarray) if isinstance(o, MemmapArrayView) else o for o in kwargs["out"])
         return getattr(ufunc, method)(*args, **kwargs)
 
     def __array_function__(self, func, types, args, kwargs):
