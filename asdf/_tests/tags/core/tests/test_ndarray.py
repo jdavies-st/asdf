@@ -1,5 +1,6 @@
 import contextlib
 import io
+import operator
 import os
 import re
 import sys
@@ -1022,20 +1023,16 @@ def test_memmap_write(tmp_path):
         assert af["data"][0] == 42
 
 
-_MEMMAP_DATA_ACCESSING_OPS = [
+# Public operations on the lazy array returned by af["a"] that read its data.
+_MEMMAP_DATA_OPS = [
     pytest.param(lambda arr: arr[:5], id="getitem"),
     pytest.param(lambda arr: arr.sum(), id="sum"),
     pytest.param(lambda arr: arr + 1, id="add"),
     pytest.param(lambda arr: arr == 1, id="eq"),
     pytest.param(np.asarray, id="np_asarray"),
 ]
-# these don't need the array's data, only its header-derived metadata, so
-# NDArrayType can (and, to avoid forcing an unnecessary load, deliberately
-# does) answer them without touching the file at all -- but only as long as
-# nothing has *already* cached the real array. Once something has (e.g. an
-# earlier op inside the same `with` block), these go through the same
-# re-validation as everything else.
-_MEMMAP_METADATA_ONLY_OPS = [
+# Public operations on the lazy array that are answered from the header.
+_MEMMAP_HEADER_OPS = [
     pytest.param(str, id="str"),
     pytest.param(repr, id="repr"),
     pytest.param(lambda arr: arr.dtype, id="dtype"),
@@ -1044,25 +1041,11 @@ _MEMMAP_METADATA_ONLY_OPS = [
 ]
 
 
-@pytest.mark.parametrize("op", _MEMMAP_DATA_ACCESSING_OPS)
-@pytest.mark.parametrize("materialize_before_close", [False, True])
-def test_memmap_array_wrapper_raises_after_close(tmp_path, op, materialize_before_close):
+@pytest.mark.parametrize("op", _MEMMAP_DATA_OPS)
+def test_memmap_unloaded_data_op_raises_after_close(tmp_path, op):
     """
-    Every way of touching a memmapped array's *data*, through the
-    tree/wrapper (as opposed to a raw view sliced off of it, see test_1334),
-    must raise cleanly once the file that backs it is closed, rather than
-    silently return stale/incorrect results or touch freed memory.
-
-    ``materialize_before_close`` matters: NDArrayType caches the real array
-    the first time it's needed (e.g. by an earlier op inside the ``with``
-    block) and re-validates that cache against the file on every subsequent
-    access. That re-validation used to only handle a *mismatched* file
-    handle; if the handle had already been garbage collected (which is
-    exactly what happens once AsdfFile.close() drops its own reference and
-    nothing else keeps the GenericFile alive) it treated "nothing to
-    compare against" as "nothing to worry about" and returned the stale,
-    now-unmapped array unchecked -- letting the exact same segfault back in
-    for ordinary wrapper access, not just for escaped raw views.
+    Reading the data of an array that was never loaded raises ``OSError``
+    once the file is closed.
     """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
@@ -1070,22 +1053,16 @@ def test_memmap_array_wrapper_raises_after_close(tmp_path, op, materialize_befor
 
     with asdf.open(fn, memmap=True) as af:
         arr = af["a"]
-        if materialize_before_close:
-            arr.sum()
 
     with pytest.raises(OSError, match="closed"):
         op(arr)
 
 
-@pytest.mark.parametrize("op", _MEMMAP_METADATA_ONLY_OPS)
-def test_memmap_array_wrapper_metadata_ok_after_close_if_unloaded(tmp_path, op):
+@pytest.mark.parametrize("op", _MEMMAP_HEADER_OPS)
+def test_memmap_unloaded_header_op_works_after_close(tmp_path, op):
     """
-    Companion to test_memmap_array_wrapper_raises_after_close: shape/dtype/
-    len/str/repr are answered from header metadata cached at parse time, so
-    they deliberately do *not* force a load (and so do not raise) as long as
-    nothing has forced the real array to be materialized yet -- see the
-    "repr alone should not force loading of the data" comments in
-    NDArrayType.
+    For an array that was never loaded, header-only operations still work
+    once the file is closed, since they don't need the file.
     """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
@@ -1094,17 +1071,14 @@ def test_memmap_array_wrapper_metadata_ok_after_close_if_unloaded(tmp_path, op):
     with asdf.open(fn, memmap=True) as af:
         arr = af["a"]
 
-    op(arr)  # must not raise
+    op(arr)
 
 
-@pytest.mark.parametrize("op", _MEMMAP_METADATA_ONLY_OPS)
-def test_memmap_array_wrapper_metadata_raises_after_close_if_loaded(tmp_path, op):
+@pytest.mark.parametrize("op", _MEMMAP_DATA_OPS + _MEMMAP_HEADER_OPS)
+def test_memmap_loaded_op_raises_after_close(tmp_path, op):
     """
-    Companion to test_memmap_array_wrapper_metadata_ok_after_close_if_unloaded:
-    once the real array *has* been materialized (e.g. by an earlier access
-    inside the ``with`` block), these go through the same re-validation as
-    data-accessing ops and must raise too, rather than reading stale header
-    fields off of an array that no longer has valid backing memory.
+    Once an array has been loaded, every operation on it raises ``OSError``
+    after the file is closed, header-only ones included.
     """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
@@ -1112,61 +1086,62 @@ def test_memmap_array_wrapper_metadata_raises_after_close_if_loaded(tmp_path, op
 
     with asdf.open(fn, memmap=True) as af:
         arr = af["a"]
-        arr.sum()
+        arr.sum()  # load the data while the file is open
 
     with pytest.raises(OSError, match="closed"):
         op(arr)
 
 
-def _open_and_derive(fn, derive):
-    """Derive something from a memmapped array, then close the file."""
-    with asdf.open(fn, memmap=True) as af:
-        return derive(af["a"])
+# Views share the mapping, so each must raise after close (all of these used
+# to segfault). "base" is the block data behind the array; the chained cases
+# take a second view off the first, keeping no reference to the intermediate.
+_MEMMAP_VIEWS = [
+    pytest.param(lambda arr: arr[:5], id="slice"),
+    pytest.param(lambda arr: arr[...], id="ellipsis"),
+    pytest.param(lambda arr: arr[None], id="newaxis"),
+    pytest.param(lambda arr: arr.view(), id="view"),
+    pytest.param(lambda arr: arr.T, id="T"),
+    pytest.param(lambda arr: arr.transpose(), id="transpose"),
+    pytest.param(lambda arr: arr.reshape(4, 5), id="reshape"),
+    pytest.param(lambda arr: arr.ravel(), id="ravel"),
+    pytest.param(lambda arr: arr.base, id="base"),
+    pytest.param(lambda arr: arr.reshape(4, 5).swapaxes(0, 1), id="chained_swapaxes"),
+    pytest.param(lambda arr: arr.reshape(1, 20).squeeze(), id="chained_squeeze"),
+    pytest.param(lambda arr: arr.reshape(4, 5)[:4, :4].diagonal(), id="chained_diagonal"),
+]
+# Public calls on a view that touch its data.
+_MEMMAP_VIEW_CALLS = [
+    pytest.param(lambda view: view == 1, id="eq"),
+    pytest.param(lambda view: view[0], id="getitem"),
+    pytest.param(lambda view: operator.setitem(view, 0, 1), id="setitem"),
+    pytest.param(lambda view: np.concatenate([view, view]), id="concatenate"),
+]
 
 
-# ways of getting at the array's memory that all share the mapping: every one
-# of these used to segfault when used after the file was closed
-@pytest.mark.parametrize(
-    "derive",
-    [
-        pytest.param(lambda arr: arr[:5], id="slice"),
-        pytest.param(lambda arr: arr[...], id="ellipsis"),
-        pytest.param(lambda arr: arr[None], id="newaxis"),
-        pytest.param(lambda arr: arr.view(), id="view"),
-        pytest.param(lambda arr: arr.T, id="T"),
-        pytest.param(lambda arr: arr.transpose(), id="transpose"),
-        pytest.param(lambda arr: arr.reshape(4, 5), id="reshape"),
-        pytest.param(lambda arr: arr.ravel(), id="ravel"),
-        pytest.param(lambda arr: arr.base, id="base"),
-        # chained: a second view taken off of the first, with no reference
-        # kept to the intermediate. The guard rides along via
-        # __array_finalize__, so depth doesn't matter.
-        pytest.param(lambda arr: arr.reshape(4, 5).swapaxes(0, 1), id="chained_swapaxes"),
-        pytest.param(lambda arr: arr.reshape(1, 20).squeeze(), id="chained_squeeze"),
-        pytest.param(lambda arr: arr.reshape(4, 5)[:4, :4].diagonal(), id="chained_diagonal"),
-    ],
-)
-def test_memmap_view_raises_after_close(tmp_path, derive):
+@pytest.mark.parametrize("call", _MEMMAP_VIEW_CALLS)
+@pytest.mark.parametrize("make_view", _MEMMAP_VIEWS)
+def test_memmap_view_raises_after_close(tmp_path, make_view, call):
+    """
+    Views of memmapped data are np.memmap instances, and raise ``OSError``
+    when used after the file is closed.
+    """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
     asdf.AsdfFile({"a": a}).write_to(fn)
 
-    view = _open_and_derive(fn, derive)
+    with asdf.open(fn, memmap=True) as af:
+        view = make_view(af["a"])
 
     assert isinstance(view, ndarray.MemmapArrayView)
+    assert isinstance(view, np.memmap)
     with pytest.raises(OSError, match="closed"):
-        np.all(view == 1)
-    with pytest.raises(OSError, match="closed"):
-        view[0]
-    with pytest.raises(OSError, match="closed"):
-        view[0] = 1
+        call(view)
 
 
-# results that own their own memory must keep working after the file closes --
-# copying data out is the supported way to keep it, so a guard that fired here
-# would be worse than useless
+# Operations whose result owns its memory: these must stay usable after close,
+# since copying out is how data is meant to outlive the file.
 @pytest.mark.parametrize(
-    "derive",
+    "op",
     [
         pytest.param(lambda arr: arr.copy(), id="copy"),
         pytest.param(lambda arr: arr[:5].copy(), id="slice_copy"),
@@ -1176,53 +1151,41 @@ def test_memmap_view_raises_after_close(tmp_path, derive):
         pytest.param(lambda arr: arr.astype("int32"), id="astype"),
     ],
 )
-def test_memmap_independent_result_usable_after_close(tmp_path, derive):
+def test_memmap_independent_result_usable_after_close(tmp_path, op):
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
     asdf.AsdfFile({"a": a}).write_to(fn)
 
-    result = _open_and_derive(fn, derive)
+    with asdf.open(fn, memmap=True) as af:
+        result = op(af["a"])
 
-    # must not raise: this data is not in the mapping any more
-    assert result[0] is not None
-    np.all(result == 1)
+    # Indexing and comparison must work, and give the same values as the same
+    # operation on the source array.
+    assert result[0] == op(a)[0]
+    assert_array_equal(result, op(a))
 
 
 def test_memmap_view_repr_does_not_raise_after_close(tmp_path):
     """
-    repr/str are called while building error messages and tracebacks, so a
-    raising repr turns an unrelated failure into a confusing one. They report
-    the closed state instead.
-    """
-    a = np.arange(20, dtype="uint8")
-    fn = tmp_path / "test.asdf"
-    asdf.AsdfFile({"a": a}).write_to(fn)
-
-    view = _open_and_derive(fn, lambda arr: arr[:5])
-
-    assert "closed" in repr(view)
-    assert "closed" in str(view)
-
-
-def test_memmap_view_is_memmap_instance(tmp_path):
-    """
-    Memmapped data is still identifiable as such: MemmapArrayView subclasses
-    np.memmap so that isinstance checks that predate it keep working.
+    repr/str of a view report that the file is closed rather than raising,
+    since they're called while building error messages and tracebacks.
     """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
     asdf.AsdfFile({"a": a}).write_to(fn)
 
     with asdf.open(fn, memmap=True) as af:
-        assert isinstance(af["a"].base, np.memmap)
-        assert isinstance(af["a"][:5], np.memmap)
+        view = af["a"][:5]
+
+    assert "closed" in repr(view)
+    assert "closed" in str(view)
 
 
 def test_memmap_view_roundtrips(tmp_path):
     """
-    A memmapped view is still a normal array as far as writing is concerned;
-    converters are looked up by exact type, so MemmapArrayView has to be
-    registered like the other ndarray subclasses.
+    A view can be written to a new file. Converters are matched by exact type,
+    so this relies on MemmapArrayView being registered with the ndarray
+    converter.
     """
     a = np.arange(20, dtype="uint8")
     fn = tmp_path / "test.asdf"
