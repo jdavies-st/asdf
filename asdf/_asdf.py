@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import gc
 import io
 import os
 import time
@@ -24,6 +25,7 @@ from ._helpers import is_set, validate_version
 from .config import config_context, get_config
 from .exceptions import (
     AsdfManifestURIMismatchWarning,
+    AsdfMemmapWarning,
     AsdfPackageVersionWarning,
     AsdfWarning,
 )
@@ -145,6 +147,9 @@ class AsdfFile:
         self._tagged_object_cache = lazy_nodes._TaggedObjectCache()
 
         self._fd: GenericFile | None = None
+        # set while __exit__ is closing, so that a warning raised by close()
+        # points at the with statement instead of at __exit__
+        self._in_context_exit = False
         self._mode: FileMode | None = None
         self._closed = False
         self._external_asdf_by_uri = {}
@@ -251,7 +256,11 @@ class AsdfFile:
         return self
 
     def __exit__(self, type_, value, traceback) -> None:
-        self.close()
+        self._in_context_exit = True
+        try:
+            self.close()
+        finally:
+            self._in_context_exit = False
 
     def _check_extensions(self, tree: Mapping[TreeKey, Any], strict: bool = False) -> None:
         """
@@ -475,7 +484,18 @@ class AsdfFile:
         """
         Close the file handles associated with the `asdf.AsdfFile`.
         """
+        mapping_ref = None
+        filename = ""
         if self._fd and not self._closed:
+            # Take a weak reference to the memory map, if the file has one,
+            # before dropping asdf's own references to it below. If the map
+            # is still alive at the end of this method then the caller is
+            # holding array data and the file stays open.
+            mapping = getattr(self._fd, "_mmap", None)
+            if mapping is not None:
+                mapping_ref = weakref.ref(mapping)
+                filename = f"'{self._fd._uri}' " if self._fd._uri else ""
+            del mapping
             # This is ok to always do because GenericFile knows
             # whether it "owns" the file and should close it.
             self._fd.close()
@@ -489,6 +509,23 @@ class AsdfFile:
             external.close()
         self._external_asdf_by_uri.clear()
         self._blocks.close()
+        still_mapped = mapping_ref is not None and mapping_ref() is not None
+        if still_mapped:
+            # A reference cycle, such as a recursive tree, can keep the map
+            # alive even when the caller kept no array data, so only warn if
+            # it is still there after collecting cycles.
+            gc.collect()
+            still_mapped = mapping_ref() is not None
+        if still_mapped:
+            warnings.warn(
+                f"Memory mapped array data from {filename}is still referenced, so the file "
+                "was not closed. Arrays read with memmap=True, and views of them, share "
+                "memory with the file. Copy the data that has to outlive the file (for "
+                "example arr[:10].copy()) or delete the references before closing. See "
+                "https://asdf.readthedocs.io/en/latest/asdf/arrays.html#memory-mapping",
+                AsdfMemmapWarning,
+                stacklevel=3 if self._in_context_exit else 2,
+            )
 
     def __deepcopy__(self, memo):
         return self.__class__(

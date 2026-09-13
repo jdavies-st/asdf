@@ -1,0 +1,3 @@
+Warn with ``AsdfMemmapWarning`` when a file is closed while memory mapped
+array data read from it is still referenced. Such a file stays open until
+those references are released.

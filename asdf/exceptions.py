@@ -8,6 +8,7 @@ __all__ = [
     "AsdfFutureWarning",
     "AsdfLazyReferenceError",
     "AsdfManifestURIMismatchWarning",
+    "AsdfMemmapWarning",
     "AsdfPackageVersionWarning",
     "AsdfProvisionalAPIWarning",
     "AsdfSerializationError",
@@ -67,6 +68,13 @@ class AsdfManifestURIMismatchWarning(AsdfWarning):
     """
     A warning indicaing that an extension registered with a manifest
     contains a id that does not match the uri of the manifest.
+    """
+
+
+class AsdfMemmapWarning(AsdfWarning):
+    """
+    A warning indicating that a file was closed while memory mapped array
+    data read from it is still referenced, which keeps the file open.
     """
 
 

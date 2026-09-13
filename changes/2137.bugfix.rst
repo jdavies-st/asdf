@@ -1,0 +1,3 @@
+Release the memory map when a file opened with ``memmap=True`` and
+``lazy_load=False`` is closed. Eagerly loaded block data was kept by the
+block manager, which held the file open even when the caller kept nothing.
