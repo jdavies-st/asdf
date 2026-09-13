@@ -484,6 +484,52 @@ context.
 Attempting to access memory mapped array data after the corresponding
 file has been closed will result in an error.
 
+Memory mapped arrays, and views of them, share memory with the file.
+Closing the file only releases it if nothing refers to that memory any
+more, so array data kept past the end of the ``with`` block keeps the
+file open. When that happens asdf raises an ``AsdfMemmapWarning``.
+
+.. code::
+
+    with asdf.open('my_data.asdf', memmap=True) as af:
+        subset = af["my_array"][:10]
+
+    # warns: subset still maps my_data.asdf, so it was not closed
+
+Copy the data that has to outlive the file, or delete the references
+before leaving the block.
+
+.. code::
+
+    with asdf.open('my_data.asdf', memmap=True) as af:
+        subset = af["my_array"][:10].copy()
+
+    # no warning, and subset is usable: it owns its memory
+    print(subset[0])
+
+Anything sharing memory with the file keeps it open, which covers more
+than plain slices:
+
+- views such as ``arr[:10]``, ``arr.T``, ``arr.reshape(...)`` and
+  ``arr.ravel()``, and anything chained from them
+- the numpy function forms, such as `numpy.reshape`,
+  `numpy.broadcast_to` and `numpy.split`
+- a field of a structured array (``arr['flux']``), a single row of one
+  (``arr[0]``), and ``.real`` or ``.imag`` of a complex array
+- rows produced by iterating a 2-D array, and ``arr.flat``
+- buffers such as ``arr.data``, ``memoryview(arr)`` and ``arr.ctypes``
+- the array returned by ``af['my_array']`` itself, once it has been read
+
+Results that own their memory do not keep the file open: ``.copy()``,
+arithmetic, "fancy" and boolean indexing, ``.astype()`` with a new
+dtype, reductions such as ``.sum()``, and ``.tolist()``.
+
+.. note::
+
+   Where the reference is stored makes no difference. A view held in a
+   list, a dict, an instance attribute (``self.data = af['data'][:10]``)
+   or a closure keeps the file open just as a local variable does.
+
 .. warning::
 
    If a file is opened with memory mapping and write access

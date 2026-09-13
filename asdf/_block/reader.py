@@ -47,6 +47,13 @@ class ReadBlock:
 
     def close(self) -> None:
         self._cached_data = None
+        # _data holds either the block data itself or, for a lazily loaded
+        # block, a callback that reads the data on demand. Only real data can
+        # hold a memory map, so drop it and let the file be released. The
+        # callback holds nothing but a weak reference to the file, so leave it
+        # in place to keep raising its own "already been closed" error.
+        if not callable(self._data):
+            self._data = None
 
     @property
     def loaded(self) -> bool:

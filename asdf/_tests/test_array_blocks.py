@@ -817,6 +817,7 @@ def test_open_no_memmap(filename_with_array, open_kwargs, should_memmap):
             assert isinstance(array.base, np.memmap)
         else:
             assert not isinstance(array.base, np.memmap)
+        del array  # release any mapping so the file can close
 
 
 def test_add_block_before_fully_loaded(tmp_path):
@@ -986,3 +987,4 @@ def test_views_save_base(tmp_path, default_array_save_base, save_base):
             assert len(base) == 100
         else:
             assert len(base) == 10
+        del base  # release the mapping so the file can close

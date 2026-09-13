@@ -1016,6 +1016,7 @@ def test_memmap_write(tmp_path):
         assert data.flags.writeable is True
         data[0] = 42
         assert data[0] == 42
+        del data  # release the mapping so the file can close
 
     with asdf.open(tmpfile, mode="rw", memmap=True) as af:
         assert af["data"][0] == 42
@@ -1084,6 +1085,7 @@ def test_block_data_change(pad_blocks, tmp_path):
         af.update()
         array_after = af.tree["data"].__array__()
         assert array_before is not array_after
+        del array_before, array_after  # release the mappings so the file can close
         assert np.all(af.tree["data"][:5] == 1)
         assert np.all(af.tree["data"][5:] == 0)
 

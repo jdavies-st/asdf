@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 
 import asdf
+from asdf.exceptions import AsdfMemmapWarning
 
 
 def test_memmap_view_access_after_close(tmp_path):
@@ -15,7 +17,10 @@ def test_memmap_view_access_after_close(tmp_path):
     fn = tmp_path / "test.asdf"
     asdf.AsdfFile({"a": a}).write_to(fn)
 
-    with asdf.open(fn, memmap=True) as af:
-        v = af["a"][:5]
+    # the view keeps the file mapped, which is what makes the access below
+    # safe and what the warning reports
+    with pytest.warns(AsdfMemmapWarning, match="still referenced"):
+        with asdf.open(fn, memmap=True) as af:
+            v = af["a"][:5]
 
     assert np.all(v == 1)
