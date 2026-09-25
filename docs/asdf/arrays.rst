@@ -496,8 +496,7 @@ file open. When that happens asdf raises an ``AsdfMemmapWarning``.
 
     # warns: subset still maps my_data.asdf, so it was not closed
 
-Copy the data that has to outlive the file, or delete the references
-before leaving the block.
+Copy the data that has to outlive the file.
 
 .. code::
 

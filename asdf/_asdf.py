@@ -520,8 +520,9 @@ class AsdfFile:
             warnings.warn(
                 f"Memory mapped array data from {filename}is still referenced, so the file "
                 "was not closed. Arrays read with memmap=True, and views of them, share "
-                "memory with the file. Copy the data that has to outlive the file (for "
-                "example arr[:10].copy()) or delete the references before closing. See "
+                "memory with the file, and the file stays open until nothing refers to that "
+                "memory. To release it, copy the data you need to keep, for example "
+                "arr[:10].copy(). See "
                 "https://asdf.readthedocs.io/en/latest/asdf/arrays.html#memory-mapping",
                 AsdfMemmapWarning,
                 stacklevel=3 if self._in_context_exit else 2,
