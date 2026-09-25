@@ -274,10 +274,11 @@ def test_update_does_not_warn(tmp_path):
 
 
 def test_warning_names_the_file(arrays_file):
-    with pytest.warns(AsdfMemmapWarning, match=str(arrays_file)):
+    with pytest.warns(AsdfMemmapWarning) as record:
         with asdf.open(arrays_file, memmap=True) as af:
             kept = af["a"][:5]
 
+    assert arrays_file.name in str(record.pop(AsdfMemmapWarning).message)
     assert kept is not None
 
 
